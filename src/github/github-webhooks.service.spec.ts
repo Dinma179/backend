@@ -11,6 +11,12 @@ import * as sigUtil from './webhook-signature.util';
 describe('GithubWebhooksService', () => {
   let service: GithubWebhooksService;
   let webhookEventRepo: { create: jest.Mock; save: jest.Mock };
+  let webhookEventRepo: {
+    create: jest.Mock;
+    save: jest.Mock;
+    findOne: jest.Mock;
+  };
+  let issueRepo: { findOne: jest.Mock };
   let bountyRepo: { findOne: jest.Mock };
   let bountiesService: {
     markInReview: jest.Mock;
@@ -30,6 +36,8 @@ describe('GithubWebhooksService', () => {
         ...data,
       })),
       save: jest.fn((data: Partial<WebhookEvent>) => Promise.resolve(data)),
+      // No delivery recorded yet unless a test says otherwise (#308).
+      findOne: jest.fn().mockResolvedValue(null),
     };
     bountyRepo = { findOne: jest.fn() };
     bountiesService = {
@@ -623,6 +631,105 @@ describe('GithubWebhooksService', () => {
 
       expect(event.status).toBe(WebhookEventStatus.FAILED);
       expect(event.error).toContain('escrow release failed');
+    });
+  });
+
+  // #308: a redelivered X-GitHub-Delivery used to hit the unique constraint
+  // on webhook_events.deliveryId and escape handleEvent as a 500, so every
+  // redelivery of that event failed forever.
+  describe('duplicate deliveries (#308)', () => {
+    const payload = {
+      action: 'closed',
+      number: 1,
+      pull_request: {
+        html_url: 'x',
+        number: 1,
+        merged: true,
+        body: 'Fixes #1',
+      },
+      repository: { id: 1, full_name: 'a/b' },
+    };
+
+    it('returns the stored event without re-running business logic', async () => {
+      webhookEventRepo.findOne.mockResolvedValueOnce({
+        id: 'event-existing',
+        deliveryId: 'delivery-dup-1',
+        status: WebhookEventStatus.PROCESSED,
+      });
+
+      const event = await service.handleEvent(
+        'pull_request',
+        'delivery-dup-1',
+        payload,
+        true,
+      );
+
+      expect(event.id).toBe('event-existing');
+      expect(event.status).toBe(WebhookEventStatus.PROCESSED);
+      expect(webhookEventRepo.save).not.toHaveBeenCalled();
+      expect(bountiesService.markMergedAndRelease).not.toHaveBeenCalled();
+    });
+
+    it('treats a unique-constraint violation from a racing delivery as benign', async () => {
+      const uniqueViolation = Object.assign(new Error('duplicate key value'), {
+        code: '23505',
+      });
+      webhookEventRepo.save.mockRejectedValueOnce(uniqueViolation);
+      webhookEventRepo.findOne
+        .mockResolvedValueOnce(null) // first lookup: not recorded yet
+        .mockResolvedValueOnce({
+          id: 'event-winner',
+          deliveryId: 'delivery-race-1',
+          status: WebhookEventStatus.PROCESSED,
+        });
+
+      const event = await service.handleEvent(
+        'pull_request',
+        'delivery-race-1',
+        payload,
+        true,
+      );
+
+      expect(event.id).toBe('event-winner');
+      expect(bountiesService.markMergedAndRelease).not.toHaveBeenCalled();
+    });
+
+    it('rethrows a non-unique insert failure', async () => {
+      const dbError = Object.assign(new Error('connection terminated'), {
+        code: '08006',
+      });
+      webhookEventRepo.save.mockRejectedValueOnce(dbError);
+
+      await expect(
+        service.handleEvent('pull_request', 'delivery-fail-1', payload, true),
+      ).rejects.toThrow('connection terminated');
+    });
+
+    it('processes a first-time delivery normally', async () => {
+      const event = await service.handleEvent(
+        'pull_request',
+        'delivery-fresh-1',
+        payload,
+        true,
+      );
+
+      expect(webhookEventRepo.findOne).toHaveBeenCalledWith({
+        where: { deliveryId: 'delivery-fresh-1' },
+      });
+      expect(webhookEventRepo.save).toHaveBeenCalled();
+      expect(event.status).toBe(WebhookEventStatus.PROCESSED);
+    });
+
+    it('skips the dedupe lookup for a delivery without an id', async () => {
+      const event = await service.handleEvent(
+        'pull_request',
+        undefined,
+        payload,
+        true,
+      );
+
+      expect(webhookEventRepo.findOne).not.toHaveBeenCalled();
+      expect(event.deliveryId).toBeNull();
     });
   });
 });
