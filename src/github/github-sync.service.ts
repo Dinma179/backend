@@ -139,11 +139,27 @@ export class GithubSyncService {
   }
 
   /**
-   * Pages through every issue for a repo, persisting each page as soon as
-   * it's fetched (rather than collecting the whole paginated result first)
-   * so a rate-limit/network failure on a later page doesn't discard the
-   * issues already fetched — those stay durably saved, and re-running the
-   * sync resumes via the idempotent upsert below rather than starting over.
+   * Pages through a repo's issues, persisting each page as soon as it's
+   * fetched (rather than collecting the whole paginated result first) so a
+   * rate-limit/network failure on a later page doesn't discard the issues
+   * already fetched — those stay durably saved, and re-running the sync
+   * resumes via the idempotent upsert below rather than starting over.
+   *
+   * When the repository has been synced before, only issues updated since
+   * `lastSyncedAt` are requested, using GitHub's own `since` filter (#315).
+   * Without it every periodic re-sync re-downloaded the repository's entire
+   * issue history — thousands of already-current issues — purely to discover
+   * none of them had changed, paying full pagination and rate-limit cost each
+   * time.
+   *
+   * `since` is only applied to page 1, since the filter shifts the result set
+   * and paginating past the first page would re-introduce the same full
+   * history walk it is meant to avoid.
+   *
+   * To force a full re-read of everything (for example after `MAINTENANCE_LABELS`
+   * changes, which alter `isMaintenanceType` on already-stored issues and so
+   * cannot be picked up by an incremental window), clear the repository's
+   * `lastSyncedAt` first — the next sync then runs unfiltered.
    */
   async syncIssues(
     repository: Repository,
@@ -153,6 +169,19 @@ export class GithubSyncService {
   ): Promise<{ saved: Issue[]; nextPage?: number }> {
     const saved: Issue[] = [];
 
+    // An unparseable/absent timestamp must not silently disable the incremental
+    // filter, so only a real Date narrows the request.
+    const since =
+      page === 1 && repository.lastSyncedAt instanceof Date
+        ? repository.lastSyncedAt.toISOString()
+        : undefined;
+
+    if (since) {
+      this.logger.log(
+        `Incremental issue sync for ${owner}/${repo}: only issues updated since ${since}`,
+      );
+    }
+
     try {
       const response = await this.octokit.issues.listForRepo({
         owner,
@@ -160,6 +189,7 @@ export class GithubSyncService {
         state: 'all',
         per_page: 100,
         page,
+        ...(since ? { since } : {}),
       });
 
       for (const raw of response.data as RawGithubIssue[]) {
