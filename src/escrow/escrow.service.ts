@@ -133,19 +133,27 @@ export class EscrowService {
     recipientAddress: string,
     recipientId?: string,
   ): Promise<Escrow> {
-    const escrow = await this.getOrThrow(escrowId);
-    this.assertLocked(escrow);
+    // Validated before the row lock is taken so a bad recipient doesn't hold
+    // the escrow locked while the lookup runs.
     await this.assertRecipientsMatchUsers([{ recipientAddress, recipientId }]);
 
-    const result = await this.invokeRelease(escrow, 'release', [
-      [recipientAddress, TOTAL_BASIS_POINTS],
-    ]);
+    // The whole read-check-act sequence runs under a pessimistic row lock, so
+    // a second concurrent release for the same escrow blocks here, then
+    // observes the RELEASED status written by the first and is rejected —
+    // instead of both passing the LOCKED check and double-paying (#303).
+    return this.withLockedEscrow(escrowId, async (escrow, manager) => {
+      const result = await this.invokeRelease(
+        escrow,
+        'release',
+        [[recipientAddress, TOTAL_BASIS_POINTS]],
+        manager,
+      );
 
-    // The on-chain release already succeeded; the local ledger must record
-    // (escrow -> RELEASED) and the Payment row atomically, or neither, so a
-    // Payment-insert failure can never leave a permanently-mismarked escrow
-    // with no record of who was paid (#154).
-    await this.dataSource.transaction(async (manager) => {
+      // The on-chain release already succeeded; the local ledger must record
+      // (escrow -> RELEASED) and the Payment row atomically, or neither, so a
+      // Payment-insert failure can never leave a permanently-mismarked escrow
+      // with no record of who was paid (#154). The lock makes that whole span
+      // one indivisible unit.
       escrow.status = EscrowStatus.RELEASED;
       escrow.releaseTxHash = result.txHash;
       escrow.releasedAt = new Date();
@@ -163,9 +171,9 @@ export class EscrowService {
           txHash: result.txHash,
         }),
       );
-    });
 
-    return escrow;
+      return escrow;
+    });
   }
 
   /**
@@ -183,33 +191,34 @@ export class EscrowService {
     escrowId: string,
     recipients: SplitRecipient[],
   ): Promise<Payment[]> {
-    const escrow = await this.getOrThrow(escrowId);
-    this.assertLocked(escrow);
     this.assertValidSplits(recipients);
     await this.assertRecipientsMatchUsers(recipients);
 
-    const totalStroops = amountToStroops(escrow.amount);
-    // Single source of truth for the split: integer basis points summing to
-    // exactly 10,000 (100.00%), used both on-chain and to derive the ledger.
-    const bps = apportionBasisPoints(recipients.map((r) => r.percentage));
+    // Same pessimistic row lock as release(): concurrent split releases for
+    // one escrow must serialise rather than each observing LOCKED (#303).
+    return this.withLockedEscrow(escrowId, async (escrow, manager) => {
+      const totalStroops = amountToStroops(escrow.amount);
+      // Single source of truth for the split: integer basis points summing to
+      // exactly 10,000 (100.00%), used both on-chain and to derive the ledger.
+      const bps = apportionBasisPoints(recipients.map((r) => r.percentage));
 
-    const result = await this.invokeRelease(
-      escrow,
-      'splitRelease',
-      recipients.map(
-        (r, i) => [r.recipientAddress, bps[i]] as [string, number],
-      ),
-    );
+      const result = await this.invokeRelease(
+        escrow,
+        'splitRelease',
+        recipients.map(
+          (r, i) => [r.recipientAddress, bps[i]] as [string, number],
+        ),
+        manager,
+      );
 
-    const shares = splitStroops(totalStroops, bps);
-    this.reconcileSplitResult(escrow.id, totalStroops, result.returnValue);
+      const shares = splitStroops(totalStroops, bps);
+      this.reconcileSplitResult(escrow.id, totalStroops, result.returnValue);
 
-    // Atomic: the escrow flips to RELEASED and every recipient's Payment row
-    // is written in one transaction, so a mid-loop insert failure can no
-    // longer leave a RELEASED escrow with only some recipients recorded
-    // (#154).
-    const payments: Payment[] = [];
-    await this.dataSource.transaction(async (manager) => {
+      // Atomic: the escrow flips to RELEASED and every recipient's Payment row
+      // is written in one transaction, so a mid-loop insert failure can no
+      // longer leave a RELEASED escrow with only some recipients recorded
+      // (#154) — and the row lock makes that span indivisible (#303).
+      const payments: Payment[] = [];
       escrow.status = EscrowStatus.RELEASED;
       escrow.releaseTxHash = result.txHash;
       escrow.releasedAt = new Date();
@@ -233,8 +242,8 @@ export class EscrowService {
         );
         payments.push(payment);
       }
+      return payments;
     });
-    return payments;
   }
 
   /**
@@ -257,78 +266,78 @@ export class EscrowService {
     recipientId?: string,
     manager?: EntityManager,
   ): Promise<Payment> {
-    const escrow = await this.getOrThrow(escrowId);
-    this.assertLocked(escrow);
     this.assertValidAmount(amount);
-
-    const existingPayments = await this.paymentRepo.find({
-      where: { escrowId: escrow.id },
-    });
-    // Compare in stroops (BigInt) rather than Number to avoid IEEE-754
-    // precision loss / epsilon-fudge factors on financial amounts (#5).
-    const releasedSoFarStroops = existingPayments.reduce(
-      (sum, p) => sum + amountToStroops(p.amount),
-      0n,
-    );
-    const requestedStroops = amountToStroops(amount);
-    const escrowStroops = amountToStroops(escrow.amount);
-    if (releasedSoFarStroops + requestedStroops > escrowStroops) {
-      throw new BadRequestException(
-        `Partial release of ${amount} would exceed remaining escrow balance`,
-      );
-    }
-
     await this.assertRecipientsMatchUsers([{ recipientAddress, recipientId }]);
 
-    const result = await this.invokeOnLockedEscrow(
-      escrow,
-      'releasePartial',
-      () =>
-        this.soroban.invoke(
-          'release_partial',
-          [
-            escrow.milestoneId ?? escrow.bountyId ?? escrow.id,
+    // The cumulative-released balance check is read-then-write just like the
+    // status check, so it runs under the same pessimistic row lock (#303):
+    // without it, two concurrent partial releases both read the same
+    // releasedSoFarStroops and together overshoot the locked amount.
+    return this.withLockedEscrow(
+      escrowId,
+      async (escrow, mgr) => {
+        const existingPayments = await mgr.find(Payment, {
+          where: { escrowId: escrow.id },
+        });
+        // Compare in stroops (BigInt) rather than Number to avoid IEEE-754
+        // precision loss / epsilon-fudge factors on financial amounts (#5).
+        const releasedSoFarStroops = existingPayments.reduce(
+          (sum, p) => sum + amountToStroops(p.amount),
+          0n,
+        );
+        const requestedStroops = amountToStroops(amount);
+        const escrowStroops = amountToStroops(escrow.amount);
+        if (releasedSoFarStroops + requestedStroops > escrowStroops) {
+          throw new BadRequestException(
+            `Partial release of ${amount} would exceed remaining escrow balance`,
+          );
+        }
+
+        const result = await this.invokeOnLockedEscrow(
+          escrow,
+          'releasePartial',
+          () =>
+            this.soroban.invoke(
+              'release_partial',
+              [
+                escrow.milestoneId ?? escrow.bountyId ?? escrow.id,
+                recipientAddress,
+                this.toStroops(amount),
+              ],
+              this.contractOpts(escrow),
+            ),
+          mgr,
+        );
+
+        // The Payment insert and the (conditional) escrow-status flip share
+        // one transaction so the two can't diverge — same guarantee as
+        // release() and splitRelease() (#154). When an outer `manager` is
+        // supplied, reuse it so the caller's transaction also covers these
+        // writes and this call's row lock (#254, #303).
+        const payment = await mgr.save(
+          Payment,
+          this.paymentRepo.create({
+            escrowId: escrow.id,
+            recipientId: recipientId ?? null,
             recipientAddress,
-            this.toStroops(amount),
-          ],
-          this.contractOpts(escrow),
-        ),
+            amount,
+            asset: escrow.asset,
+            status: PaymentStatus.CONFIRMED,
+            txHash: result.txHash,
+          }),
+        );
+
+        if (releasedSoFarStroops + requestedStroops >= escrowStroops) {
+          escrow.status = EscrowStatus.RELEASED;
+          escrow.releaseTxHash = result.txHash;
+          escrow.releasedAt = new Date();
+          await mgr.save(Escrow, escrow);
+        }
+
+        return payment;
+      },
+      manager,
     );
-
-    // The Payment insert and the (conditional) escrow-status flip share one
-    // transaction so the two can't diverge — same guarantee as release()
-    // and splitRelease() (#154). When an outer `manager` is supplied, reuse
-    // it so the caller's transaction also covers these writes (#254).
-    let payment!: Payment;
-    const run = async (mgr: EntityManager) => {
-      payment = await mgr.save(
-        Payment,
-        this.paymentRepo.create({
-          escrowId: escrow.id,
-          recipientId: recipientId ?? null,
-          recipientAddress,
-          amount,
-          asset: escrow.asset,
-          status: PaymentStatus.CONFIRMED,
-          txHash: result.txHash,
-        }),
-      );
-
-      if (releasedSoFarStroops + requestedStroops >= escrowStroops) {
-        escrow.status = EscrowStatus.RELEASED;
-        escrow.releaseTxHash = result.txHash;
-        escrow.releasedAt = new Date();
-        await mgr.save(Escrow, escrow);
-      }
-    };
-
-    if (manager) {
-      await run(manager);
-    } else {
-      await this.dataSource.transaction(run);
-    }
-
-    return payment;
   }
 
   /**
@@ -411,6 +420,42 @@ export class EscrowService {
     return escrow;
   }
 
+  /**
+   * Runs `fn` against the escrow row while holding a `SELECT ... FOR UPDATE`
+   * lock on it, asserting the LOCKED precondition under that lock (#303).
+   *
+   * Without the lock, two concurrent requests for the same escrow both read
+   * status = LOCKED before either has written, both invoke the contract, and
+   * both record a full-amount `Payment` — a double-payout the on-chain call
+   * does not save us from in dry-run, where `SorobanClientService.invoke`
+   * succeeds unconditionally. With it, the second request blocks on the row
+   * until the first commits and then observes the non-LOCKED status.
+   *
+   * When an outer `manager` is supplied (a caller's own transaction), the
+   * lock is taken on that transaction instead of a new one, so the lock and
+   * the caller's other writes share a single atomic span (#254).
+   */
+  private async withLockedEscrow<T>(
+    escrowId: string,
+    fn: (escrow: Escrow, manager: EntityManager) => Promise<T>,
+    manager?: EntityManager,
+  ): Promise<T> {
+    const run = async (mgr: EntityManager): Promise<T> => {
+      const escrow = await mgr.findOne(Escrow, {
+        where: { id: escrowId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!escrow) throw new NotFoundException(`Escrow ${escrowId} not found`);
+      this.assertLocked(escrow);
+      return fn(escrow, mgr);
+    };
+
+    if (manager) {
+      return run(manager);
+    }
+    return this.dataSource.transaction(run);
+  }
+
   private assertLocked(escrow: Escrow) {
     if (escrow.status !== EscrowStatus.LOCKED) {
       throw new BadRequestException(
@@ -468,6 +513,7 @@ export class EscrowService {
     escrow: Escrow,
     operation: string,
     call: () => Promise<T>,
+    manager?: EntityManager,
   ): Promise<T> {
     try {
       return await call();
@@ -480,7 +526,14 @@ export class EscrowService {
           at: new Date().toISOString(),
         },
       };
-      await this.escrowRepo.save(escrow);
+      // Saved through the transaction manager when one is supplied: the row
+      // lock this call holds would otherwise make a second connection's
+      // write on the same row block against itself (#303).
+      if (manager) {
+        await manager.save(Escrow, escrow);
+      } else {
+        await this.escrowRepo.save(escrow);
+      }
       throw err;
     }
   }
@@ -496,13 +549,18 @@ export class EscrowService {
     escrow: Escrow,
     operation: string,
     recipients: Array<[string, number]>,
+    manager?: EntityManager,
   ): Promise<ContractInvocationResult> {
-    return this.invokeOnLockedEscrow(escrow, operation, () =>
-      this.soroban.invoke(
-        'release',
-        [this.onChainKeyFor(escrow), recipients],
-        this.contractOpts(escrow),
-      ),
+    return this.invokeOnLockedEscrow(
+      escrow,
+      operation,
+      () =>
+        this.soroban.invoke(
+          'release',
+          [this.onChainKeyFor(escrow), recipients],
+          this.contractOpts(escrow),
+        ),
+      manager,
     );
   }
 

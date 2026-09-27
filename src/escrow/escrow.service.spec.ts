@@ -24,7 +24,14 @@ describe('EscrowService', () => {
     tokenContractId: jest.Mock;
     escrowDeadlineSeconds: number;
   };
-  let dataSource: { transaction: jest.Mock };
+  let dataSource: {
+    transaction: jest.Mock;
+    manager: {
+      findOne: jest.Mock;
+      find: jest.Mock;
+      save: jest.Mock;
+    };
+  };
 
   beforeEach(async () => {
     escrowRepo = {
@@ -59,16 +66,27 @@ describe('EscrowService', () => {
       tokenContractId: jest.fn().mockReturnValue(''),
       escrowDeadlineSeconds: 7776000,
     };
-    // The transaction manager routes save(Entity, data) to the matching repo
-    // mock so existing escrowRepo.save / paymentRepo.save assertions still hold.
+    // The transaction manager routes find/save(Entity, data) to the matching
+    // repo mock so existing escrowRepo.findOne/save and paymentRepo.find/save
+    // assertions still hold — including the pessimistic row lock release(),
+    // splitRelease() and releasePartial() take through withLockedEscrow (#303).
     const manager = {
+      findOne: jest.fn((entity: unknown, options: unknown) =>
+        entity === Escrow ? escrowRepo.findOne(options) : Promise.resolve(null),
+      ),
+      find: jest.fn((entity: unknown, options: unknown) =>
+        entity === Payment
+          ? paymentRepo.find(options)
+          : Promise.resolve([]),
+      ),
       save: jest.fn((entity: unknown, data: unknown) =>
         entity === Payment ? paymentRepo.save(data) : escrowRepo.save(data),
       ),
     };
     dataSource = {
       transaction: jest.fn((fn: (m: typeof manager) => unknown) => fn(manager)),
-    };
+      manager,
+    } as unknown as { transaction: jest.Mock; manager: typeof manager };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -454,6 +472,142 @@ describe('EscrowService', () => {
       expect(soroban.invoke).not.toHaveBeenCalled();
       expect(paymentRepo.save).not.toHaveBeenCalled();
       expect(escrowRepo.save).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('pessimistic row locking (#303)', () => {
+    const lockedEscrow = {
+      id: 'escrow-locked',
+      status: EscrowStatus.LOCKED,
+      amount: '100.0000000',
+      asset: AssetType.USDC,
+      bountyId: 'bounty-1',
+      onChainId: '9100',
+    };
+
+    it('reads the escrow with a pessimistic_write lock inside a transaction', async () => {
+      escrowRepo.findOne.mockResolvedValue({ ...lockedEscrow });
+      paymentRepo.find.mockResolvedValue([]);
+
+      await service.release('escrow-locked', 'GRECIPIENT', 'user-1');
+
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(dataSource.manager.findOne).toHaveBeenCalledWith(Escrow, {
+        where: { id: 'escrow-locked' },
+        lock: { mode: 'pessimistic_write' },
+      });
+    });
+
+    it('holds the lock across the contract invocation and the ledger writes', async () => {
+      escrowRepo.findOne.mockResolvedValue({ ...lockedEscrow });
+      paymentRepo.find.mockResolvedValue([]);
+      const order: string[] = [];
+      dataSource.manager.findOne.mockImplementation(
+        async () => {
+          order.push('locked-read');
+          return { ...lockedEscrow };
+        },
+      );
+      soroban.invoke.mockImplementation(async () => {
+        order.push('invoke');
+        return { txHash: 'tx-1', ledger: 1, returnValue: null, status: 'SUCCESS' };
+      });
+      paymentRepo.save.mockImplementation(async (data: Partial<Payment>) => {
+        order.push('payment-write');
+        return data as Payment;
+      });
+
+      await service.release('escrow-locked', 'GRECIPIENT', 'user-1');
+
+      expect(order).toEqual(['locked-read', 'invoke', 'payment-write']);
+    });
+
+    it('rejects a non-LOCKED escrow found under the lock', async () => {
+      escrowRepo.findOne.mockResolvedValue({
+        ...lockedEscrow,
+        status: EscrowStatus.RELEASED,
+      });
+
+      await expect(
+        service.release('escrow-locked', 'GRECIPIENT'),
+      ).rejects.toThrow(BadRequestException);
+      expect(soroban.invoke).not.toHaveBeenCalled();
+      expect(paymentRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('locks splitRelease against concurrent split payouts of the same escrow', async () => {
+      escrowRepo.findOne.mockResolvedValue({ ...lockedEscrow });
+
+      await service.splitRelease('escrow-locked', [
+        { recipientAddress: 'GA', percentage: 50 },
+        { recipientAddress: 'GB', percentage: 50 },
+      ]);
+
+      expect(dataSource.manager.findOne).toHaveBeenCalledWith(Escrow, {
+        where: { id: 'escrow-locked' },
+        lock: { mode: 'pessimistic_write' },
+      });
+      // One atomic span now: the second transaction no longer exists (#154).
+      expect(dataSource.transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('locks releasePartial and reads prior payments under that lock', async () => {
+      escrowRepo.findOne.mockResolvedValue({
+        ...lockedEscrow,
+        milestoneId: 'milestone-1',
+      });
+      paymentRepo.find.mockResolvedValue([]);
+
+      await service.releasePartial('escrow-locked', '10.0000000', 'GRECIPIENT');
+
+      expect(dataSource.manager.findOne).toHaveBeenCalledWith(Escrow, {
+        where: { id: 'escrow-locked' },
+        lock: { mode: 'pessimistic_write' },
+      });
+      expect(dataSource.manager.find).toHaveBeenCalledWith(Payment, {
+        where: { escrowId: 'escrow-locked' },
+      });
+    });
+
+    it('reuses a caller-supplied transaction manager instead of opening a second one', async () => {
+      escrowRepo.findOne.mockResolvedValue({ ...lockedEscrow });
+      paymentRepo.find.mockResolvedValue([]);
+
+      await service.releasePartial(
+        'escrow-locked',
+        '10.0000000',
+        'GRECIPIENT',
+        undefined,
+        dataSource.manager,
+      );
+
+      // #254: the lock and the caller's writes share the caller's transaction.
+      expect(dataSource.transaction).not.toHaveBeenCalled();
+      expect(dataSource.manager.findOne).toHaveBeenCalledWith(Escrow, {
+        where: { id: 'escrow-locked' },
+        lock: { mode: 'pessimistic_write' },
+      });
+    });
+
+    it('records invocation failures through the locking manager, not a second connection', async () => {
+      escrowRepo.findOne.mockResolvedValue({ ...lockedEscrow });
+      paymentRepo.find.mockResolvedValue([]);
+      soroban.invoke.mockRejectedValueOnce(new Error('simulation failed'));
+
+      await expect(
+        service.release('escrow-locked', 'GRECIPIENT'),
+      ).rejects.toThrow('simulation failed');
+
+      // Saved via the manager — a second-connection write would deadlock on
+      // the row lock this call holds.
+      expect(dataSource.manager.save).toHaveBeenCalledWith(
+        Escrow,
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            lastFailure: expect.objectContaining({ operation: 'release' }),
+          }),
+        }),
+      );
     });
   });
 
