@@ -79,17 +79,51 @@ export class GithubWebhooksService {
     payload: Record<string, unknown>,
     signatureValid: boolean,
   ): Promise<WebhookEvent> {
-    const event = await this.webhookEventRepo.save(
-      this.webhookEventRepo.create({
-        eventType,
-        deliveryId: deliveryId ?? null,
-        payload,
-        signatureValid,
-        status: signatureValid
-          ? WebhookEventStatus.RECEIVED
-          : WebhookEventStatus.IGNORED,
-      }),
-    );
+    // GitHub deliveries aren't ordered and may be delivered more than once —
+    // an operator hitting "Redeliver" resends the same X-GitHub-Delivery id.
+    // `webhook_events.deliveryId` is unique, so inserting the duplicate
+    // threw a QueryFailedError that escaped handleEvent entirely and turned
+    // every redelivery into a bare 500, which GitHub then keeps retrying
+    // (#308). Short-circuit on the stored row instead.
+    if (deliveryId) {
+      const existing = await this.findByDeliveryId(deliveryId);
+      if (existing) {
+        this.logger.warn(
+          `Ignoring duplicate webhook delivery ${deliveryId} — already recorded ` +
+            `(status: ${existing.status})`,
+        );
+        return existing;
+      }
+    }
+
+    let event: WebhookEvent;
+    try {
+      event = await this.webhookEventRepo.save(
+        this.webhookEventRepo.create({
+          eventType,
+          deliveryId: deliveryId ?? null,
+          payload,
+          signatureValid,
+          status: signatureValid
+            ? WebhookEventStatus.RECEIVED
+            : WebhookEventStatus.IGNORED,
+        }),
+      );
+    } catch (err) {
+      // Two deliveries racing past the lookup above can still collide on the
+      // unique index; the loser treats that as the benign duplicate it is
+      // rather than a crash.
+      if (deliveryId && this.isUniqueViolation(err)) {
+        const raced = await this.findByDeliveryId(deliveryId);
+        if (raced) {
+          this.logger.warn(
+            `Ignoring concurrently delivered webhook ${deliveryId} — already recorded`,
+          );
+          return raced;
+        }
+      }
+      throw err;
+    }
 
     if (!signatureValid) {
       this.logger.warn(
@@ -132,6 +166,35 @@ export class GithubWebhooksService {
     }
 
     return this.webhookEventRepo.save(event);
+  }
+
+  /** The recorded row for a GitHub delivery id, or null when it is new. */
+  private async findByDeliveryId(
+    deliveryId: string,
+  ): Promise<WebhookEvent | null> {
+    return this.webhookEventRepo.findOne({ where: { deliveryId } });
+  }
+
+  /**
+   * True for a Postgres unique-constraint violation (SQLSTATE 23505) — the
+   * `deliveryId` unique index rejecting a duplicate delivery (#308).
+   */
+  private isUniqueViolation(err: unknown): boolean {
+    const code = (err as { code?: unknown } | null)?.code;
+    if (code === '23505') {
+      return true;
+    }
+    const driverCode = (
+      err as { driverError?: { code?: unknown } } | null
+    )?.driverError?.code;
+    if (driverCode === '23505') {
+      return true;
+    }
+    return /duplicate key value violates unique constraint/i.test(
+      (err as { message?: unknown } | null)?.message
+        ? String((err as { message: string }).message)
+        : '',
+    );
   }
 
   /**
