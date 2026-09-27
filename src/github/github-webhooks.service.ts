@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Bounty, Issue, WebhookEvent } from '../common/entities';
+import { Bounty, WebhookEvent } from '../common/entities';
 import { BountyStatus, WebhookEventStatus } from '../common/enums';
 import { AppConfig } from '../config/configuration';
 import { verifyGithubSignature } from './webhook-signature.util';
@@ -77,7 +77,6 @@ export class GithubWebhooksService {
     private readonly configService: ConfigService<AppConfig, true>,
     @InjectRepository(WebhookEvent)
     private readonly webhookEventRepo: Repository<WebhookEvent>,
-    @InjectRepository(Issue) private readonly issueRepo: Repository<Issue>,
     @InjectRepository(Bounty) private readonly bountyRepo: Repository<Bounty>,
     private readonly bountiesService: BountiesService,
     private readonly syncService: GithubSyncService,
@@ -267,16 +266,26 @@ export class GithubWebhooksService {
       alsoProcessOtherStatuses = false,
     }: LinkedIssueAction,
   ): Promise<LinkedIssueOutcome[]> {
+    // Resolved once per event rather than per linked issue: a PR body naming
+    // five issues would otherwise repeat the same repository lookup five times
+    // (#311).
+    const repository = await this.syncService.findRepositoryByGithubId(
+      String(payload.repository.id),
+    );
+
     const outcomes: LinkedIssueOutcome[] = [];
     for (const number of issueNumbers) {
       try {
-        const issue = await this.issueRepo.findOne({
-          where: {
-            number,
-            repository: { githubRepoId: String(payload.repository.id) },
-          },
-          relations: { repository: true, bounty: true },
-        });
+        if (!repository) {
+          outcomes.push({ issueNumber: number, outcome: 'skipped' });
+          continue;
+        }
+
+        const issue = await this.syncService.findIssueByRepoAndNumber(
+          repository.id,
+          number,
+          { repository: true, bounty: true },
+        );
         if (!issue?.bounty) {
           outcomes.push({ issueNumber: number, outcome: 'skipped' });
           continue;

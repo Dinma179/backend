@@ -4,7 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { GithubWebhooksService } from './github-webhooks.service';
 import { GithubSyncService } from './github-sync.service';
 import { BountiesService } from '../bounties/bounties.service';
-import { Bounty, Issue, WebhookEvent } from '../common/entities';
+import { Bounty, WebhookEvent } from '../common/entities';
 import { BountyStatus, WebhookEventStatus } from '../common/enums';
 
 /**
@@ -16,14 +16,17 @@ import { BountyStatus, WebhookEventStatus } from '../common/enums';
 describe('GithubWebhooksService — shared linked-issue processing (#316)', () => {
   let service: GithubWebhooksService;
   let webhookEventRepo: { create: jest.Mock; save: jest.Mock };
-  let issueRepo: { findOne: jest.Mock };
   let bountyRepo: { findOne: jest.Mock };
   let bountiesService: {
     markInReview: jest.Mock;
     markMergedAndRelease: jest.Mock;
     markPrClosedWithoutMerge: jest.Mock;
   };
-  let syncService: { findRepositoryByGithubId: jest.Mock; upsertIssueRecord: jest.Mock };
+  let syncService: {
+    findRepositoryByGithubId: jest.Mock;
+    findIssueByRepoAndNumber: jest.Mock;
+    upsertIssueRecord: jest.Mock;
+  };
 
   const PAYLOAD_BASE = {
     number: 7,
@@ -48,7 +51,6 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
       create: jest.fn((data: Partial<WebhookEvent>) => ({ id: 'event-1', ...data })),
       save: jest.fn((data: Partial<WebhookEvent>) => Promise.resolve(data)),
     };
-    issueRepo = { findOne: jest.fn() };
     bountyRepo = { findOne: jest.fn() };
     bountiesService = {
       markInReview: jest.fn().mockResolvedValue(undefined),
@@ -56,7 +58,8 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
       markPrClosedWithoutMerge: jest.fn().mockResolvedValue(undefined),
     };
     syncService = {
-      findRepositoryByGithubId: jest.fn(),
+      findRepositoryByGithubId: jest.fn().mockResolvedValue({ id: 'repo-uuid-1' }),
+      findIssueByRepoAndNumber: jest.fn(),
       upsertIssueRecord: jest.fn(),
     };
 
@@ -68,7 +71,6 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
           useValue: { get: () => ({ webhookSecret: 'secret' }) },
         },
         { provide: getRepositoryToken(WebhookEvent), useValue: webhookEventRepo },
-        { provide: getRepositoryToken(Issue), useValue: issueRepo },
         { provide: getRepositoryToken(Bounty), useValue: bountyRepo },
         { provide: BountiesService, useValue: bountiesService },
         { provide: GithubSyncService, useValue: syncService },
@@ -89,7 +91,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     };
 
     it('marks in review then releases a CLAIMED bounty', async () => {
-      issueRepo.findOne.mockResolvedValue(linkedIssue);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(linkedIssue);
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.CLAIMED));
 
       await runPullRequest(mergedPayload);
@@ -103,7 +105,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     });
 
     it('still releases a bounty that is not CLAIMED, without marking in review', async () => {
-      issueRepo.findOne.mockResolvedValue(linkedIssue);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(linkedIssue);
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.IN_REVIEW));
 
       await runPullRequest(mergedPayload);
@@ -117,7 +119,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     const openedPayload = { ...PAYLOAD_BASE, action: 'opened' };
 
     it('moves a CLAIMED bounty to in review', async () => {
-      issueRepo.findOne.mockResolvedValue(linkedIssue);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(linkedIssue);
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.CLAIMED));
 
       await runPullRequest(openedPayload);
@@ -131,7 +133,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     });
 
     it('skips a bounty that is not CLAIMED', async () => {
-      issueRepo.findOne.mockResolvedValue(linkedIssue);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(linkedIssue);
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.OPEN));
 
       await runPullRequest(openedPayload);
@@ -144,7 +146,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     const closedPayload = { ...PAYLOAD_BASE, action: 'closed' };
 
     it('returns an IN_REVIEW bounty to CLAIMED', async () => {
-      issueRepo.findOne.mockResolvedValue(linkedIssue);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(linkedIssue);
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.IN_REVIEW));
 
       await runPullRequest(closedPayload);
@@ -153,7 +155,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     });
 
     it('skips a bounty that is not IN_REVIEW', async () => {
-      issueRepo.findOne.mockResolvedValue(linkedIssue);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(linkedIssue);
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.CLAIMED));
 
       await runPullRequest(closedPayload);
@@ -164,7 +166,10 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
 
   describe('shared lookup and outcome tracking', () => {
     it('skips an issue with no tracked bounty', async () => {
-      issueRepo.findOne.mockResolvedValue({ id: 'issue-1', bounty: null });
+      syncService.findIssueByRepoAndNumber.mockResolvedValue({
+        id: 'issue-1',
+        bounty: null,
+      });
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.CLAIMED));
 
       const event = await runPullRequest({
@@ -178,7 +183,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     });
 
     it('skips when the issue is not tracked at all', async () => {
-      issueRepo.findOne.mockResolvedValue(null);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(null);
       const event = await runPullRequest({
         ...PAYLOAD_BASE,
         action: 'closed',
@@ -190,7 +195,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     });
 
     it('records a per-issue failure without aborting the other linked issues', async () => {
-      issueRepo.findOne
+      syncService.findIssueByRepoAndNumber
         .mockResolvedValueOnce(linkedIssue)
         .mockResolvedValueOnce(linkedIssue);
       bountyRepo.findOne
@@ -216,7 +221,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
     });
 
     it('de-duplicates an issue number referenced twice in the same PR body', async () => {
-      issueRepo.findOne.mockResolvedValue(linkedIssue);
+      syncService.findIssueByRepoAndNumber.mockResolvedValue(linkedIssue);
       bountyRepo.findOne.mockResolvedValue(bountyWithStatus(BountyStatus.CLAIMED));
 
       await runPullRequest({
@@ -228,7 +233,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
         },
       });
 
-      expect(issueRepo.findOne).toHaveBeenCalledTimes(1);
+      expect(syncService.findIssueByRepoAndNumber).toHaveBeenCalledTimes(1);
     });
 
     it('does nothing when the PR body links no issue', async () => {
@@ -238,7 +243,7 @@ describe('GithubWebhooksService — shared linked-issue processing (#316)', () =
         pull_request: { ...PAYLOAD_BASE.pull_request, merged: true, body: 'No links here' },
       });
 
-      expect(issueRepo.findOne).not.toHaveBeenCalled();
+      expect(syncService.findIssueByRepoAndNumber).not.toHaveBeenCalled();
       expect(event.status).toBe(WebhookEventStatus.PROCESSED);
     });
   });

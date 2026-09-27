@@ -8,7 +8,10 @@ import {
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Octokit } from '@octokit/rest';
-import { Repository as TypeOrmRepository } from 'typeorm';
+import {
+  FindOptionsRelations,
+  Repository as TypeOrmRepository,
+} from 'typeorm';
 import { ANALYTICS_PLATFORM_INVALIDATE_EVENT } from '../analytics/analytics.events';
 import { Issue, Repository } from '../common/entities';
 import { IssueState } from '../common/enums';
@@ -207,9 +210,7 @@ export class GithubSyncService {
     const githubIssueId = String(raw.id);
     const incomingUpdatedAt = new Date(raw.updated_at);
 
-    const existing = await this.issueRepo.findOne({
-      where: { githubIssueId },
-    });
+    const existing = await this.findIssueByGithubIdOrNull(githubIssueId);
 
     if (
       existing?.githubUpdatedAt &&
@@ -265,18 +266,44 @@ export class GithubSyncService {
     return data;
   }
 
+  /**
+   * Looks up a tracked issue by its GitHub issue id, or null when it isn't
+   * tracked yet. This is the read path shared by {@link findIssueByGithubId}
+   * and the sync's own upsert, so an issue is never resolved by two different
+   * queries (#311).
+   */
+  async findIssueByGithubIdOrNull(
+    githubIssueId: string,
+  ): Promise<Issue | null> {
+    return this.issueRepo.findOne({ where: { githubIssueId } });
+  }
+
+  /**
+   * Same lookup for callers that treat an untracked issue as an error rather
+   * than as "not seen yet" (#311).
+   */
   async findIssueByGithubId(githubIssueId: string): Promise<Issue> {
-    const issue = await this.issueRepo.findOne({ where: { githubIssueId } });
+    const issue = await this.findIssueByGithubIdOrNull(githubIssueId);
     if (!issue)
       throw new NotFoundException(`Issue ${githubIssueId} not tracked`);
     return issue;
   }
 
+  /**
+   * Resolves an issue by the repository it belongs to and its in-repo number —
+   * the lookup a linked issue in a pull_request body needs, where only the
+   * number and the owning repository are known (#311). `relations` lets a
+   * caller pull in what it needs alongside (the webhook path loads `bounty`).
+   */
   async findIssueByRepoAndNumber(
     repositoryId: string,
     number: number,
+    relations?: FindOptionsRelations<Issue>,
   ): Promise<Issue | null> {
-    return this.issueRepo.findOne({ where: { repositoryId, number } });
+    return this.issueRepo.findOne({
+      where: { repositoryId, number },
+      ...(relations ? { relations } : {}),
+    });
   }
 
   /**

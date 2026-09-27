@@ -4,14 +4,13 @@ import { ConfigService } from '@nestjs/config';
 import { GithubWebhooksService } from './github-webhooks.service';
 import { GithubSyncService } from './github-sync.service';
 import { BountiesService } from '../bounties/bounties.service';
-import { Bounty, Issue, WebhookEvent } from '../common/entities';
+import { Bounty, WebhookEvent } from '../common/entities';
 import { WebhookEventStatus } from '../common/enums';
 import * as sigUtil from './webhook-signature.util';
 
 describe('GithubWebhooksService', () => {
   let service: GithubWebhooksService;
   let webhookEventRepo: { create: jest.Mock; save: jest.Mock };
-  let issueRepo: { findOne: jest.Mock };
   let bountyRepo: { findOne: jest.Mock };
   let bountiesService: {
     markInReview: jest.Mock;
@@ -20,6 +19,7 @@ describe('GithubWebhooksService', () => {
   };
   let syncService: {
     findRepositoryByGithubId: jest.Mock;
+    findIssueByRepoAndNumber: jest.Mock;
     upsertIssueRecord: jest.Mock;
   };
 
@@ -31,7 +31,6 @@ describe('GithubWebhooksService', () => {
       })),
       save: jest.fn((data: Partial<WebhookEvent>) => Promise.resolve(data)),
     };
-    issueRepo = { findOne: jest.fn() };
     bountyRepo = { findOne: jest.fn() };
     bountiesService = {
       markInReview: jest.fn().mockResolvedValue(undefined),
@@ -39,7 +38,10 @@ describe('GithubWebhooksService', () => {
       markPrClosedWithoutMerge: jest.fn().mockResolvedValue(undefined),
     };
     syncService = {
-      findRepositoryByGithubId: jest.fn(),
+      findRepositoryByGithubId: jest.fn().mockResolvedValue({
+        id: 'repo-uuid-1',
+      }),
+      findIssueByRepoAndNumber: jest.fn(),
       upsertIssueRecord: jest.fn(),
     };
 
@@ -54,7 +56,6 @@ describe('GithubWebhooksService', () => {
           provide: getRepositoryToken(WebhookEvent),
           useValue: webhookEventRepo,
         },
-        { provide: getRepositoryToken(Issue), useValue: issueRepo },
         { provide: getRepositoryToken(Bounty), useValue: bountyRepo },
         { provide: BountiesService, useValue: bountiesService },
         { provide: GithubSyncService, useValue: syncService },
@@ -86,7 +87,7 @@ describe('GithubWebhooksService', () => {
   });
 
   it('processes a merged pull_request event and releases the linked bounty', async () => {
-    issueRepo.findOne.mockResolvedValue({
+    syncService.findIssueByRepoAndNumber.mockResolvedValue({
       id: 'issue-1',
       bounty: { id: 'bounty-1' },
     });
@@ -123,7 +124,7 @@ describe('GithubWebhooksService', () => {
   });
 
   it('handles a closed-but-not-merged PR by moving linked bounties back to CLAIMED', async () => {
-    issueRepo.findOne.mockResolvedValue({
+    syncService.findIssueByRepoAndNumber.mockResolvedValue({
       id: 'issue-1',
       bounty: { id: 'bounty-1' },
     });
@@ -157,7 +158,7 @@ describe('GithubWebhooksService', () => {
   });
 
   it('skips bounty reset for closed-but-not-merged PR when bounty is not IN_REVIEW', async () => {
-    issueRepo.findOne.mockResolvedValue({
+    syncService.findIssueByRepoAndNumber.mockResolvedValue({
       id: 'issue-1',
       bounty: { id: 'bounty-1' },
     });
@@ -180,7 +181,7 @@ describe('GithubWebhooksService', () => {
 
   describe('PR opened / reopened (#168)', () => {
     it('moves a linked CLAIMED bounty to IN_REVIEW when its PR is opened', async () => {
-      issueRepo.findOne.mockResolvedValue({
+      syncService.findIssueByRepoAndNumber.mockResolvedValue({
         id: 'issue-1',
         bounty: { id: 'bounty-1' },
       });
@@ -218,7 +219,7 @@ describe('GithubWebhooksService', () => {
     });
 
     it('leaves a bounty that is not CLAIMED untouched on a reopened PR', async () => {
-      issueRepo.findOne.mockResolvedValue({
+      syncService.findIssueByRepoAndNumber.mockResolvedValue({
         id: 'issue-1',
         bounty: { id: 'bounty-1' },
       });
@@ -254,7 +255,7 @@ describe('GithubWebhooksService', () => {
     function mockIssueAndBounty(
       byNumber: Record<number, { bountyId: string; status: string }>,
     ) {
-      issueRepo.findOne.mockImplementation(
+      syncService.findIssueByRepoAndNumber.mockImplementation(
         ({ where }: { where: { number: number } }) => {
           const entry = byNumber[where.number];
           return Promise.resolve(
@@ -361,7 +362,7 @@ describe('GithubWebhooksService', () => {
 
   describe('owner/repo-qualified closing keywords', () => {
     it("resolves a closing keyword qualified with the webhook's own owner/repo", async () => {
-      issueRepo.findOne.mockResolvedValue({
+      syncService.findIssueByRepoAndNumber.mockResolvedValue({
         id: 'issue-1',
         bounty: { id: 'bounty-1' },
       });
@@ -415,7 +416,7 @@ describe('GithubWebhooksService', () => {
         true,
       );
 
-      expect(issueRepo.findOne).not.toHaveBeenCalled();
+      expect(syncService.findIssueByRepoAndNumber).not.toHaveBeenCalled();
       expect(bountiesService.markMergedAndRelease).not.toHaveBeenCalled();
       expect(event.status).toBe(WebhookEventStatus.PROCESSED);
     });
@@ -504,7 +505,7 @@ describe('GithubWebhooksService', () => {
 
       expect(event.status).toBe(WebhookEventStatus.INVALID_PAYLOAD);
       expect(event.error).toContain('pull_request');
-      expect(issueRepo.findOne).not.toHaveBeenCalled();
+      expect(syncService.findIssueByRepoAndNumber).not.toHaveBeenCalled();
     });
 
     it('rejects a pull_request payload whose merged flag has the wrong type', async () => {
@@ -589,7 +590,7 @@ describe('GithubWebhooksService', () => {
     });
 
     it('still distinguishes a genuine processing failure as FAILED, not INVALID_PAYLOAD', async () => {
-      issueRepo.findOne.mockResolvedValue({
+      syncService.findIssueByRepoAndNumber.mockResolvedValue({
         id: 'issue-1',
         bounty: { id: 'bounty-1' },
       });
